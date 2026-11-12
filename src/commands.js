@@ -3,7 +3,7 @@ import path from 'node:path';
 import { computeCoupling, computeDiff, couple, greenClosure } from './diff.js';
 import { capture, killTree, runCommand, shellJoin } from './exec.js';
 import { ensureTarballs } from './fetch.js';
-import { readJson, writeJson } from './fsx.js';
+import { readJson, real, writeJson } from './fsx.js';
 import { findCulprit } from './bisect.js';
 import { explainCulprits, failingLocations } from './explain.js';
 import { ago, factorLabel, reasonText, t } from './i18n.js';
@@ -17,6 +17,7 @@ import { detectManager } from './packages.js';
 import { Workspace } from './workspace.js';
 import { PnpmWorkspace } from './pnpm.js';
 import { cleanupStaleSandboxes, createSandbox } from './sandbox.js';
+import { YarnPnpWorkspace } from './yarnpnp.js';
 
 class UserError extends Error {}
 
@@ -302,6 +303,7 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
   const config = loadConfig(root);
 
   const current = await takeSnapshot(root, process.env, { ignoreEnv: config.ignoreEnv });
+  if (current.packageError) throw new UserError(t('pnpInspectFailed', current.packageError));
   if (opts.fromGit && (opts.against || opts.node)) throw new UserError(t('fromGitConflict'));
   let green = opts.node ? null : opts.against ? loadSnapshotFile(opts.against) : store.latest('green');
   if (opts.fromGit) {
@@ -363,11 +365,17 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
     return;
   }
 
-  const command = opts.command ?? green.command ?? config.command;
+  // A snapshot from someone else (--against) never decides what gets executed here:
+  // only this project's own config, package.json or the --command flag do.
+  const pkgJson = readJson(path.join(root, 'package.json'), {});
+  const ownCommand = config.command ?? unwrapTestScript(pkgJson?.scripts?.test, pkgJson?.lastgreen) ?? defaultCommand(root, current.manager);
+  const command = opts.command ?? (green.exported ? ownCommand : green.command ?? ownCommand);
   if (!command) throw new UserError(t('noCommandWhy'));
   const cwd = !green.exported && green.cwd != null ? path.join(root, ...green.cwd.split('/').filter(Boolean)) : process.cwd();
   const cache = cacheDir();
   const pnpmMode = green.layout === 'pnpm' && current.layout === 'pnpm';
+  const yarnPnpMode = green.layout === 'pnp' && current.layout === 'pnp' && green.manager === 'yarn' && current.manager === 'yarn';
+  if (yarnPnpMode && opts.noSandbox) throw new UserError(t('yarnSandboxRequired'));
   const preparedTarballs = new Map();
   let preparedNodeDir = null;
 
@@ -380,7 +388,7 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
       const factor = key.startsWith('pnpm:') && !current.packages[key] ? byName.get(entry.name) : null;
       if (factor) needs.push({ id: `${factor.id}|${key}`, key: key.slice(5), entry: { name: entry.name, version: entry.version, integrity: entry.integrity, resolved: entry.resolved }, factor });
     }
-  } else {
+  } else if (!yarnPnpMode) {
     for (const f of diff.factors.filter((x) => x.testable && x.kind === 'package')) {
       for (const p of f.paths) if (p.green) needs.push({ id: `${f.id}|${p.key}`, key: p.key, entry: p.green, factor: f });
     }
@@ -449,7 +457,8 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
   }
 
   let sandbox = null;
-  let sandboxMode = opts.noSandbox ? 'off' : opts.sandbox ? 'required' : 'auto';
+  let sandboxMode = yarnPnpMode ? 'required' : opts.noSandbox ? 'off' : opts.sandbox ? 'required' : 'auto';
+  if (yarnPnpMode) isolation = { ...isolation, mode: 'required-pnp' };
   const relativeCwd = path.relative(root, cwd);
   if (relativeCwd.startsWith('..') || path.isAbsolute(relativeCwd)) {
     if (sandboxMode === 'required') throw new UserError(t('sandboxCwd'));
@@ -501,7 +510,9 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
   const journal = sandbox ? path.join(executionRoot, '.lastgreen', 'journal.json') : store.journal;
   const ws = pnpmMode
     ? new PnpmWorkspace(executionRoot, journal)
-    : new Workspace(executionRoot, journal, { rebuild: Boolean(opts.rebuild), nodePath: current.node?.path });
+    : yarnPnpMode
+      ? new YarnPnpWorkspace(executionRoot, journal, { offline: Boolean(opts.offline), version: current.tools?.yarn, rebuild: Boolean(opts.rebuild) })
+      : new Workspace(executionRoot, journal, { rebuild: Boolean(opts.rebuild), nodePath: current.node?.path });
   for (const [key, file] of preparedTarballs) ws.setTarball(key, file);
   ws.nodeDir = preparedNodeDir;
   // Like `npm run`: local binaries (vitest, jest, tsc...) resolve without npx.
@@ -518,6 +529,7 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
   say(c.dim(t(sandbox ? 'safetySandbox' : 'safety')));
 
   let child = null;
+  if (yarnPnpMode) ws.onChild = (ch) => (child = ch);
   const restoreNow = () => {
     try {
       ws.restore();
@@ -612,11 +624,17 @@ export async function cmdWhy(opts, { dryRun = false } = {}) {
   try {
     wrong = ws.verify(current);
     if (sandbox) {
-      const variants = [executionRoot, executionRoot.replace(/\\/g, '/')];
-      const originals = [root, root.replace(/\\/g, '/')];
+      // Tools print canonical paths (macOS /private/var, Windows long names): map those too.
+      // Longest first: on macOS /var/folders/x is a substring of /private/var/folders/x,
+      // and replacing the short one first would leave "/private" + project path.
+      const pairs = [];
+      for (const p of new Set([executionRoot, real(executionRoot)])) {
+        pairs.push([p, root], [p.replace(/\\/g, '/'), root.replace(/\\/g, '/')]);
+      }
+      pairs.sort((a, b) => b[0].length - a[0].length);
       for (const [key, value] of outputs) {
         let mapped = value;
-        for (let i = 0; i < variants.length; i++) mapped = mapped.split(variants[i]).join(originals[i]);
+        for (const [from, to] of pairs) mapped = mapped.split(from).join(to);
         outputs.set(key, mapped);
       }
     }

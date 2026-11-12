@@ -10,7 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdirp, readJson } from './fsx.js';
+import { mkdirp, readJson, real } from './fsx.js';
 import { keyToPath } from './packages.js';
 import { getJson as httpGetJson, getText as httpGetText } from './http.js';
 
@@ -71,7 +71,8 @@ export function failingLocations(output, root, limit = 2, cwd = root) {
       }
     }
     const abs = path.isAbsolute(file) ? path.resolve(file) : path.resolve(cwd, file);
-    const rel = path.relative(root, abs);
+    let rel = path.relative(root, abs);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) rel = path.relative(real(root), real(abs));
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || rel.split(/[\\/]/).includes('node_modules')) continue;
     const key = `${rel}:${h.line}`;
     if (seen.has(key)) continue;
@@ -256,7 +257,7 @@ function packageDir(factor, root, current) {
 export async function packageNotes(factor, { root, current, cacheDir, offline, env = process.env, words = new Set(), boost = () => 0 }) {
   if (factor.change !== 'changed' || !factor.from || !factor.to) return null;
   const dir = packageDir(factor, root, current);
-  const pkg = dir ? readJson(path.join(dir, 'package.json')) : null;
+  const pkg = dir ? readJson(path.join(dir, 'package.json')) : factor.yarn?.manifest ?? null;
   // 1. A changelog shipped inside the package.
   if (dir) {
     let files = [];
